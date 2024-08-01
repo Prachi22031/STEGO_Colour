@@ -14,6 +14,9 @@ import torch.multiprocessing
 import seaborn as sns
 from pytorch_lightning.callbacks import ModelCheckpoint
 import sys
+import cv2  
+from sklearn.cluster import KMeans
+import numpy as np
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -49,7 +52,25 @@ def get_class_labels(dataset_name):
     else:
         raise ValueError("Unknown Dataset {}".format(dataset_name))
 
+def get_patches(img, patch_size):
+    patches = []
+    h, w, _ = img.shape
+    for i in range(0, h, patch_size):
+        for j in range(0, w, patch_size):
+            patch = img[i:i+patch_size, j:j+patch_size]
+            patches.append(patch)
+    return patches
 
+def compute_avg_rgb(patches):
+    avg_rgb = [patch.mean(axis=(0, 1)) for patch in patches]
+    return np.array(avg_rgb)
+
+def color_based_clustering(image, patch_size, n_clusters):
+    patches = get_patches(image, patch_size)
+    avg_rgb = compute_avg_rgb(patches)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+    return kmeans.labels_
+    
 class LitUnsupervisedSegmenter(pl.LightningModule):
     def __init__(self, n_classes, cfg):
         super().__init__()
@@ -70,8 +91,10 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         else:
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
+        # color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
 
+        # Initializing cluster probes with an option for extra clusters if needed
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
         self.linear_probe = nn.Conv2d(dim, n_classes, (1, 1))
 
@@ -97,6 +120,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         self.automatic_optimization = False
 
+        # Color map for dataset visualization
         if self.cfg.dataset_name.startswith("cityscapes"):
             self.label_cmap = create_cityscapes_colormap()
         else:
@@ -106,14 +130,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.save_hyperparameters()
 
     def forward(self, x):
-        # in lightning, forward defines the prediction/inference actions
         return self.net(x)[1]
 
     def training_step(self, batch, batch_idx):
-        # training_step defined the train loop.
-        # It is independent of forward
+        # optimizers
         net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
-
         net_optim.zero_grad()
         linear_probe_optim.zero_grad()
         cluster_probe_optim.zero_grad()
@@ -127,11 +148,12 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             label = batch["label"]
             label_pos = batch["label_pos"]
 
+        # Obtaining features and codes from the network
         feats, code = self.net(img)
         if self.cfg.correspondence_weight > 0:
             feats_pos, code_pos = self.net(img_pos)
-        log_args = dict(sync_dist=False, rank_zero_only=True)
 
+        # Preparing signals based on true labels or features
         if self.cfg.use_true_labels:
             signal = one_hot_feats(label + 1, self.n_classes + 1)
             signal_pos = one_hot_feats(label_pos + 1, self.n_classes + 1)
@@ -140,10 +162,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             signal_pos = feats_pos
 
         loss = 0
-
         should_log_hist = (self.cfg.hist_freq is not None) and \
                           (self.global_step % self.cfg.hist_freq == 0) and \
                           (self.global_step > 0)
+
+        # Salience maps
         if self.cfg.use_salience:
             salience = batch["mask"].to(torch.float32).squeeze(1)
             salience_pos = batch["mask_pos"].to(torch.float32).squeeze(1)
@@ -151,21 +174,32 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             salience = None
             salience_pos = None
 
+        # Color-based clustering
+        def color_based_clustering(image, patch_size, n_clusters):
+            patches = self.get_patches(image, patch_size)
+            avg_rgb = self.compute_avg_rgb(patches)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+            return kmeans.labels_
+
+        # Performing color-based clustering on the image
+        patch_size = 16 
+        n_clusters = self.n_classes  # Or any other number of clusters
+        img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
+        color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
+
+        # Integrate color clusters into the segmentation pipeline
+        # Example integration: adjust `code` with color clustering information or use it in a custom loss function
+        # Placeholder: convert `color_clusters` to a tensor or use it to refine `code`
+
         if self.cfg.correspondence_weight > 0:
-            (
-                pos_intra_loss, pos_intra_cd,
-                pos_inter_loss, pos_inter_cd,
-                neg_inter_loss, neg_inter_cd,
-            ) = self.contrastive_corr_loss_fn(
-                signal, signal_pos,
-                salience, salience_pos,
-                code, code_pos,
-            )
+            pos_intra_loss, pos_intra_cd, pos_inter_loss, pos_inter_cd, neg_inter_loss, neg_inter_cd = self.contrastive_corr_loss_fn(
+                signal, signal_pos, salience, salience_pos, code, code_pos)
 
             if should_log_hist:
                 self.logger.experiment.add_histogram("intra_cd", pos_intra_cd, self.global_step)
                 self.logger.experiment.add_histogram("inter_cd", pos_inter_cd, self.global_step)
                 self.logger.experiment.add_histogram("neg_cd", neg_inter_cd, self.global_step)
+
             neg_inter_loss = neg_inter_loss.mean()
             pos_intra_loss = pos_intra_loss.mean()
             pos_inter_loss = pos_inter_loss.mean()
@@ -238,18 +272,10 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         if self.global_step % 2000 == 0 and self.global_step > 0:
             print("RESETTING TFEVENT FILE")
-            # Make a new tfevent file
             self.logger.experiment.close()
             self.logger.experiment._get_file_writer()
 
         return loss
-
-    def on_train_start(self):
-        tb_metrics = {
-            **self.linear_metrics.compute(),
-            **self.cluster_metrics.compute()
-        }
-        self.logger.log_hyperparams(self.cfg, tb_metrics)
 
     def validation_step(self, batch, batch_idx):
         img = batch["img"]
@@ -259,6 +285,22 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         with torch.no_grad():
             feats, code = self.net(img)
             code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
+
+            # Color-based clustering for validation
+            def color_based_clustering(image, patch_size, n_clusters):
+                patches = self.get_patches(image, patch_size)
+                avg_rgb = self.compute_avg_rgb(patches)
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+                return kmeans.labels_
+
+            patch_size = 16
+            n_clusters = self.n_classes  
+            img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
+            color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
+
+            # Integrate color clusters into the validation pipeline
+            # Example integration: adjust `code` with color clustering information or use it in a custom evaluation
+            # Placeholder: convert `color_clusters` to a tensor or use it to refine `code`
 
             linear_preds = self.linear_probe(code)
             linear_preds = linear_preds.argmax(1)
@@ -283,8 +325,8 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             }
 
             if self.trainer.is_global_zero and not self.cfg.submitting_to_aml:
-                #output_num = 0
-                output_num = random.randint(0, len(outputs) -1)
+                # Select a random output for visualization
+                output_num = random.randint(0, len(outputs) - 1)
                 output = {k: v.detach().cpu() for k, v in outputs[output_num].items()}
 
                 fig, ax = plt.subplots(4, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 4 * 3))
@@ -320,8 +362,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     colors = [self.label_cmap[i] / 255.0 for i in range(len(names))]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.xaxis.get_ticklabels())]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.yaxis.get_ticklabels())]
-                    # ax.yaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
-                    # ax.xaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
                     plt.xticks(rotation=90)
                     plt.yticks(rotation=0)
                     ax.vlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_xlim())
@@ -358,17 +398,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     plt.tight_layout()
                     add_plot(self.logger.experiment, "label frequency", self.global_step)
 
-            if self.global_step > 2:
-                self.log_dict(tb_metrics)
-
-                if self.trainer.is_global_zero and self.cfg.azureml_logging:
-                    from azureml.core.run import Run
-                    run_logger = Run.get_context()
-                    for metric, value in tb_metrics.items():
-                        run_logger.log(metric, value)
-
-            self.linear_metrics.reset()
-            self.cluster_metrics.reset()
 
     def configure_optimizers(self):
         main_params = list(self.net.parameters())
@@ -376,35 +405,64 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         if self.cfg.rec_weight > 0:
             main_params.extend(self.decoder.parameters())
 
+        # Main optimizer for network parameters
         net_optim = torch.optim.Adam(main_params, lr=self.cfg.lr)
+
+        # Separate optimizers for probe layers
         linear_probe_optim = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
         cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
-        return net_optim, linear_probe_optim, cluster_probe_optim
+        return [net_optim], [linear_probe_optim, cluster_probe_optim]
 
+import os
+import sys
+import random
+from datetime import datetime
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import torchvision.transforms as T
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch.utils.data import DataLoader
+from omegaconf import DictConfig, OmegaConf
+import hydra
+import torch
+import torch.nn.functional as F
+from torchmetrics.classification import MulticlassAccuracy
+
+from my_model import LitUnsupervisedSegmenter  
+from my_dataset import ContrastiveSegDataset  
+from my_utils import get_transform, add_plot, remove_axes, create_cityscapes_colormap, create_pascal_label_colormap
 
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
     print(OmegaConf.to_yaml(cfg))
+    
     pytorch_data_dir = cfg.pytorch_data_dir
-    data_dir = join(cfg.output_root, "data")
-    log_dir = join(cfg.output_root, "logs")
-    checkpoint_dir = join(cfg.output_root, "checkpoints")
+    data_dir = os.path.join(cfg.output_root, "data")
+    log_dir = os.path.join(cfg.output_root, "logs")
+    checkpoint_dir = os.path.join(cfg.output_root, "checkpoints")
 
-    prefix = "{}/{}_{}".format(cfg.log_dir, cfg.dataset_name, cfg.experiment_name)
-    name = '{}_date_{}'.format(prefix, datetime.now().strftime('%b%d_%H-%M-%S'))
-    cfg.full_name = prefix
-
+    # Creating directories if they do not exist
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    prefix = f"{cfg.log_dir}/{cfg.dataset_name}_{cfg.experiment_name}"
+    name = f"{prefix}_date_{datetime.now().strftime('%b%d_%H-%M-%S')}"
+    cfg.full_name = prefix
+
+    # Seed everything for reproducibility
     seed_everything(seed=0)
 
-    print(data_dir)
-    print(cfg.output_root)
+    print(f"Data directory: {data_dir}")
+    print(f"Log directory: {log_dir}")
 
+    # Define data transformations
     geometric_transforms = T.Compose([
         T.RandomHorizontalFlip(),
         T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
@@ -414,8 +472,6 @@ def my_app(cfg: DictConfig) -> None:
         T.RandomGrayscale(.2),
         T.RandomApply([T.GaussianBlur((5, 5))])
     ])
-
-    sys.stdout.flush()
 
     train_dataset = ContrastiveSegDataset(
         pytorch_data_dir=pytorch_data_dir,
@@ -433,10 +489,7 @@ def my_app(cfg: DictConfig) -> None:
         pos_labels=True
     )
 
-    if cfg.dataset_name == "voc":
-        val_loader_crop = None
-    else:
-        val_loader_crop = "center"
+    val_loader_crop = None if cfg.dataset_name == "voc" else "center"
 
     val_dataset = ContrastiveSegDataset(
         pytorch_data_dir=pytorch_data_dir,
@@ -449,14 +502,9 @@ def my_app(cfg: DictConfig) -> None:
         cfg=cfg,
     )
 
-    #val_dataset = MaterializedDataset(val_dataset)
     train_loader = DataLoader(train_dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
 
-    if cfg.submitting_to_aml:
-        val_batch_size = 16
-    else:
-        val_batch_size = cfg.batch_size
-
+    val_batch_size = 16 if cfg.submitting_to_aml else cfg.batch_size
     val_loader = DataLoader(val_dataset, val_batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
     model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
@@ -466,18 +514,9 @@ def my_app(cfg: DictConfig) -> None:
         default_hp_metric=False
     )
 
-    if cfg.submitting_to_aml:
-        gpu_args = dict(gpus=1, val_check_interval=250)
-
-        if gpu_args["val_check_interval"] > len(train_loader):
-            gpu_args.pop("val_check_interval")
-
-    else:
-        gpu_args = dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
-        # gpu_args = dict(gpus=1, accelerator='ddp', val_check_interval=cfg.val_freq)
-
-        if gpu_args["val_check_interval"] > len(train_loader) // 4:
-            gpu_args.pop("val_check_interval")
+    gpu_args = dict(gpus=1, val_check_interval=250) if cfg.submitting_to_aml else dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
+    if gpu_args["val_check_interval"] > len(train_loader):
+        gpu_args.pop("val_check_interval")
 
     trainer = Trainer(
         log_every_n_steps=cfg.scalar_log_freq,
@@ -498,5 +537,4 @@ def my_app(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    prep_args()
     my_app()
