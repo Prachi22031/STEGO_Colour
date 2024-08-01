@@ -1,22 +1,41 @@
-from utils import *
-from modules import *
-from data import *
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
+# General imports
+import os
+import sys
+import random
 from datetime import datetime
-import hydra
-from omegaconf import DictConfig, OmegaConf
+from pathlib import Path
+
+# Data manipulation and visualization
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import cv2
+from sklearn.cluster import KMeans
+import torchvision.transforms as T
+
+# PyTorch and PyTorch Lightning
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchmetrics.classification import MulticlassAccuracy
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.seed import seed_everything
-import torch.multiprocessing
-import seaborn as sns
 from pytorch_lightning.callbacks import ModelCheckpoint
-import sys
-import cv2  
-from sklearn.cluster import KMeans
-import numpy as np
+from pytorch_lightning.utilities.seed import seed_everything
+
+# Configuration and utilities
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+# Custom modules
+from utils import *
+from modules import *
+from data import *
+from my_model import LitUnsupervisedSegmenter
+from my_dataset import ContrastiveSegDataset
+from my_utils import get_transform, add_plot, remove_axes, create_cityscapes_colormap, create_pascal_label_colormap
+
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -414,28 +433,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         return [net_optim], [linear_probe_optim, cluster_probe_optim]
 
-import os
-import sys
-import random
-from datetime import datetime
-from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import torchvision.transforms as T
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader
-from omegaconf import DictConfig, OmegaConf
-import hydra
-import torch
-import torch.nn.functional as F
-from torchmetrics.classification import MulticlassAccuracy
-
-from my_model import LitUnsupervisedSegmenter  
-from my_dataset import ContrastiveSegDataset  
-from my_utils import get_transform, add_plot, remove_axes, create_cityscapes_colormap, create_pascal_label_colormap
 
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
