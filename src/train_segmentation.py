@@ -32,9 +32,7 @@ from omegaconf import DictConfig, OmegaConf
 from utils import *
 from modules import *
 from data import *
-from my_model import LitUnsupervisedSegmenter
-from my_dataset import ContrastiveSegDataset
-from my_utils import get_transform, add_plot, remove_axes, create_cityscapes_colormap, create_pascal_label_colormap
+
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
