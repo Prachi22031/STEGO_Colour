@@ -199,7 +199,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             return kmeans.labels_
 
         # Performing color-based clustering on the image
-        patch_size = 70
+        patch_size = 170
         n_clusters = self.n_classes  # Or any other number of clusters
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
@@ -310,7 +310,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
                 return kmeans.labels_
 
-            patch_size = 70
+            patch_size = 170
             n_clusters = self.n_classes  
             img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
             color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
