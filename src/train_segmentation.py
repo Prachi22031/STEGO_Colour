@@ -206,7 +206,18 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         # Integrate color clusters into the segmentation pipeline
         # Example integration: adjust `code` with color clustering information or use it in a custom loss function
+        
         # Placeholder: convert `color_clusters` to a tensor or use it to refine `code`
+          # Convert color clusters to tensor
+        color_clusters_tensor = torch.tensor(color_clusters, dtype=torch.long, device=code.device)
+        color_clusters_tensor = color_clusters_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        color_clusters_tensor = F.interpolate(color_clusters_tensor, size=code.shape[2:], mode='bilinear', align_corners=False)
+        color_clusters_tensor = color_clusters_tensor.squeeze(0).squeeze(0)  # Remove extra dimensions
+        code_refined = code * color_clusters_tensor.unsqueeze(1).float()
+
+
+
+        
 
         if self.cfg.correspondence_weight > 0:
             pos_intra_loss, pos_intra_cd, pos_inter_loss, pos_inter_cd, neg_inter_loss, neg_inter_cd = self.contrastive_corr_loss_fn(
@@ -294,44 +305,96 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        img = batch["img"]
-        label = batch["label"]
-        self.net.eval()
 
-        with torch.no_grad():
-            feats, code = self.net(img)
-            code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
+
+
+        def validation_step(self, batch, batch_idx):
+            img = batch["img"]
+            label = batch["label"]
+            self.net.eval()
+
+            with torch.no_grad():
+        # Obtain features and segmentation codes from the network
+                feats, code = self.net(img)
+                code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
+
+        # Color-based clustering for validation
+                def color_based_clustering(image, patch_size, n_clusters):
+                    patches = self.get_patches(image, patch_size)
+                    avg_rgb = self.compute_avg_rgb(patches)
+                    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+                    return kmeans.labels_
+
+                patch_size = 170
+                n_clusters = self.n_classes  
+                img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
+
+        # Perform color-based clustering on the first image of the batch
+                color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)
+
+        # Convert color clusters to tensor
+                color_clusters_tensor = torch.tensor(color_clusters, dtype=torch.long, device=code.device)
+                color_clusters_tensor = color_clusters_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+
+        # Interpolate color clusters to match the size of `code`
+                color_clusters_tensor = F.interpolate(color_clusters_tensor, size=code.shape[2:], mode='bilinear', align_corners=False)
+                color_clusters_tensor = color_clusters_tensor.squeeze(0).squeeze(0)  # Remove extra dimensions
+
+        # Refine segmentation codes using color clusters
+                code_refined = code * color_clusters_tensor.unsqueeze(1).float()  # Adjust `code` with color clusters
+
+        # Perform decoding and prediction
+                pred = self.decoder(code_refined)
+                pred = F.interpolate(pred, label.shape[-2:], mode='bilinear', align_corners=False)
+                pred = pred.argmax(1)
+
+        # Logging images for every 2000th batch
+                if batch_idx % 2000 == 0:
+                    self.logger.experiment.add_images("validation_img", img, self.global_step)
+                    self.logger.experiment.add_images("validation_pred", pred.unsqueeze(1).float(), self.global_step)
+                    self.logger.experiment.add_images("validation_label", label.unsqueeze(1).float(), self.global_step)
+
+            return pred
+
+
+    #def validation_step(self, batch, batch_idx):
+     #   img = batch["img"]
+      #  label = batch["label"]
+       # self.net.eval()
+
+     #   with torch.no_grad():
+      #      feats, code = self.net(img)
+       #     code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
 
             # Color-based clustering for validation
-            def color_based_clustering(image, patch_size, n_clusters):
-                patches = self.get_patches(image, patch_size)
-                avg_rgb = self.compute_avg_rgb(patches)
-                kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
-                return kmeans.labels_
+        #    def color_based_clustering(image, patch_size, n_clusters):
+                #patches = self.get_patches(image, patch_size)
+                #avg_rgb = self.compute_avg_rgb(patches)
+                #kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+                #return kmeans.labels_
 
-            patch_size = 170
-            n_clusters = self.n_classes  
-            img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
-            color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
+            #patch_size = 170
+            #n_clusters = self.n_classes  
+            #img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
+            #color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
 
             # Integrate color clusters into the validation pipeline
             # Example integration: adjust `code` with color clustering information or use it in a custom evaluation
             # Placeholder: convert `color_clusters` to a tensor or use it to refine `code`
 
-            linear_preds = self.linear_probe(code)
-            linear_preds = linear_preds.argmax(1)
-            self.linear_metrics.update(linear_preds, label)
+            #linear_preds = self.linear_probe(code)
+            #linear_preds = linear_preds.argmax(1)
+            #self.linear_metrics.update(linear_preds, label)
 
-            cluster_loss, cluster_preds = self.cluster_probe(code, None)
-            cluster_preds = cluster_preds.argmax(1)
-            self.cluster_metrics.update(cluster_preds, label)
+            #cluster_loss, cluster_preds = self.cluster_probe(code, None)
+            #cluster_preds = cluster_preds.argmax(1)
+            #self.cluster_metrics.update(cluster_preds, label)
 
-            return {
-                'img': img[:self.cfg.n_images].detach().cpu(),
-                'linear_preds': linear_preds[:self.cfg.n_images].detach().cpu(),
-                "cluster_preds": cluster_preds[:self.cfg.n_images].detach().cpu(),
-                "label": label[:self.cfg.n_images].detach().cpu()}
+            #return {
+               # 'img': img[:self.cfg.n_images].detach().cpu(),
+                #'linear_preds': linear_preds[:self.cfg.n_images].detach().cpu(),
+                #"cluster_preds": cluster_preds[:self.cfg.n_images].detach().cpu(),
+                #"label": label[:self.cfg.n_images].detach().cpu()}
 
     def validation_epoch_end(self, outputs) -> None:
         super().validation_epoch_end(outputs)
